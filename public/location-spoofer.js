@@ -235,6 +235,7 @@
         var payload = b & 0x7f;
         current += 1;
         count += 1;
+        if (count === 10 && payload > 1) throw new Error("Malformed int64 varint overflow");
 
         if (shift < 32) {
           low = (low | ((payload << shift) >>> 0)) >>> 0;
@@ -271,7 +272,7 @@
         var fieldNumber = tagVal >>> 3;
         var wireType = tagVal & 0x07;
 
-        if (fieldNumber <= 0) {
+        if (tagVarint.high !== 0 || fieldNumber <= 0) {
           throw new Error("Invalid protobuf field number: " + fieldNumber);
         }
 
@@ -294,7 +295,7 @@
           var lenVarint = Varint64.decode(bytes, offset);
           offset = lenVarint.offset;
           var length = lenVarint.low;
-          if (offset + length > bytes.length) {
+          if (lenVarint.high !== 0 || offset + length > bytes.length) {
             throw new Error("Protobuf length-delimited exceeds buffer bounds");
           }
           var valueBytes = bytes.subarray(offset, offset + length);
@@ -427,7 +428,8 @@
         appIdentifier: appIdentifier,
         osVersion: osVersion,
         functionId: functionId,
-        payload: bytes.slice(state.offset, state.offset + payloadLength)
+        payload: bytes.slice(state.offset, state.offset + payloadLength),
+        suffix: bytes.slice(state.offset + payloadLength)
       };
     },
 
@@ -439,7 +441,8 @@
         ArpcCodec.writePascalString(arpc.osVersion),
         ArpcCodec.writeUInt32BE(arpc.functionId),
         ArpcCodec.writeUInt32BE(arpc.payload.length),
-        arpc.payload
+        arpc.payload,
+        arpc.suffix || new Uint8Array(0)
       ]);
     }
   };
@@ -451,31 +454,88 @@
     return Math.round(Number(deg) * 100000000);
   }
 
+  function sameBytes(a, b) {
+    if (a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
+    return true;
+  }
+
+  // Only the known int64/1e8 schema is supported. Do not guess fixed64,
+  // ZigZag, duplicate fields, or arbitrary nested messages as coordinates.
+  function locationSchema(fields) {
+    var lat = null;
+    var lon = null;
+    var latCount = 0;
+    var lonCount = 0;
+    for (var i = 0; i < fields.length; i += 1) {
+      if (fields[i].fieldNumber === 1) { lat = fields[i]; latCount += 1; }
+      if (fields[i].fieldNumber === 2) { lon = fields[i]; lonCount += 1; }
+    }
+    if (latCount !== 1 || lonCount !== 1 || lat.wireType !== 0 || lon.wireType !== 0 ||
+        !Number.isSafeInteger(lat.int64Value) || !Number.isSafeInteger(lon.int64Value) ||
+        Math.abs(lat.int64Value) > 9000000000 || Math.abs(lon.int64Value) > 18000000000) return null;
+    return { latitude: lat.int64Value, longitude: lon.int64Value };
+  }
+
+  function inspectWlocCoordinates(payload, config) {
+    var report = {
+      scannedWifi: 0, scannedCell: 0, supportedRecords: 0,
+      unsupportedRecords: 0, malformedRecords: 0, targetRecords: 0,
+      coordinateWireTypes: { varint: 0, fixed64: 0, fixed32: 0, other: 0 }
+    };
+    var fields = ProtobufEngine.readFields(payload);
+    for (var i = 0; i < fields.length; i += 1) {
+      var entity = fields[i];
+      var wifi = entity.fieldNumber === 2;
+      if (entity.wireType !== 2 || (!wifi && !CELL_RESPONSE_TAGS[entity.fieldNumber])) continue;
+      if (wifi) report.scannedWifi += 1;
+      else report.scannedCell += 1;
+      var found = false;
+      try {
+        var nested = ProtobufEngine.readFields(entity.valueBytes);
+        for (var j = 0; j < nested.length; j += 1) {
+          if (nested[j].fieldNumber !== (wifi ? 2 : 5) || nested[j].wireType !== 2) continue;
+          found = true;
+          try {
+            var location = ProtobufEngine.readFields(nested[j].valueBytes);
+            for (var k = 0; k < location.length; k += 1) {
+              if (location[k].fieldNumber !== 1 && location[k].fieldNumber !== 2) continue;
+              var wire = location[k].wireType;
+              var label = wire === 0 ? "varint" : wire === 1 ? "fixed64" : wire === 5 ? "fixed32" : "other";
+              report.coordinateWireTypes[label] += 1;
+            }
+            var schema = locationSchema(location);
+            if (!schema) { report.unsupportedRecords += 1; continue; }
+            report.supportedRecords += 1;
+            if (schema.latitude === coordToInt(config.latitude) && schema.longitude === coordToInt(config.longitude)) {
+              report.targetRecords += 1;
+            }
+          } catch (err) { report.malformedRecords += 1; }
+        }
+      } catch (err) { report.malformedRecords += 1; found = true; }
+      if (!found) report.unsupportedRecords += 1;
+    }
+    return report;
+  }
+
   // 最小改写 Location 子消息：仅替换已存在的 纬度(1)/经度(2)/水平精度(3)，原值透传其余所有字段
-  function patchLocationRecord(locationBytes, config) {
+  function patchLocationRecord(locationBytes, config, diagnostics) {
     if (!locationBytes || locationBytes.length === 0) return locationBytes;
-    var fields = ProtobufEngine.readFields(locationBytes);
-    var hasLat = false;
-    var hasLon = false;
-    var i;
-
-    for (i = 0; i < fields.length; i += 1) {
-      if (fields[i].fieldNumber === 1 && fields[i].wireType === 0) hasLat = true;
-      if (fields[i].fieldNumber === 2 && fields[i].wireType === 0) hasLon = true;
-    }
-
-    // 若无经纬度结构，原样放行，避免破坏响应结构
-    if (!hasLat || !hasLon) {
-      return locationBytes;
-    }
+    var fields;
+    try { fields = ProtobufEngine.readFields(locationBytes); }
+    catch (err) { return locationBytes; }
+    if (!locationSchema(fields)) return locationBytes;
 
     var parts = [];
-    for (i = 0; i < fields.length; i += 1) {
+    for (var i = 0; i < fields.length; i += 1) {
       var f = fields[i];
-      if (f.fieldNumber === 1 && f.wireType === 0) {
-        parts.push(ProtobufEngine.makeVarintField(1, coordToInt(config.latitude)));
-      } else if (f.fieldNumber === 2 && f.wireType === 0) {
-        parts.push(ProtobufEngine.makeVarintField(2, coordToInt(config.longitude)));
+      if ((f.fieldNumber === 1 || f.fieldNumber === 2) && f.wireType === 0) {
+        var replacement = ProtobufEngine.makeVarintField(f.fieldNumber,
+          coordToInt(f.fieldNumber === 1 ? config.latitude : config.longitude));
+        if (!sameBytes(f.raw, replacement) && diagnostics) {
+          diagnostics[f.fieldNumber === 1 ? "modifiedLatitudeFields" : "modifiedLongitudeFields"] += 1;
+        }
+        parts.push(replacement);
       } else if (f.fieldNumber === 3 && f.wireType === 0) {
         parts.push(ProtobufEngine.makeVarintField(3, config.horizontalAccuracy));
       } else {
@@ -485,13 +545,15 @@
     return ByteUtils.concat(parts);
   }
 
-  function patchWifiEntity(wifiBytes, config) {
-    var fields = ProtobufEngine.readFields(wifiBytes);
+  function patchWifiEntity(wifiBytes, config, diagnostics) {
+    var fields;
+    try { fields = ProtobufEngine.readFields(wifiBytes); }
+    catch (err) { return wifiBytes; }
     var parts = [];
     for (var i = 0; i < fields.length; i += 1) {
       var f = fields[i];
       if (f.fieldNumber === 2 && f.wireType === 2) {
-        parts.push(ProtobufEngine.makeLengthDelimitedField(2, patchLocationRecord(f.valueBytes, config)));
+        parts.push(ProtobufEngine.makeLengthDelimitedField(2, patchLocationRecord(f.valueBytes, config, diagnostics)));
       } else {
         parts.push(f.raw);
       }
@@ -499,13 +561,15 @@
     return ByteUtils.concat(parts);
   }
 
-  function patchCellEntity(cellBytes, config) {
-    var fields = ProtobufEngine.readFields(cellBytes);
+  function patchCellEntity(cellBytes, config, diagnostics) {
+    var fields;
+    try { fields = ProtobufEngine.readFields(cellBytes); }
+    catch (err) { return cellBytes; }
     var parts = [];
     for (var i = 0; i < fields.length; i += 1) {
       var f = fields[i];
       if (f.fieldNumber === 5 && f.wireType === 2) {
-        parts.push(ProtobufEngine.makeLengthDelimitedField(5, patchLocationRecord(f.valueBytes, config)));
+        parts.push(ProtobufEngine.makeLengthDelimitedField(5, patchLocationRecord(f.valueBytes, config, diagnostics)));
       } else {
         parts.push(f.raw);
       }
@@ -514,6 +578,20 @@
   }
 
   function patchWlocPayload(payloadBytes, config) {
+    if (!Number.isFinite(Number(config.latitude)) || !Number.isFinite(Number(config.longitude)) ||
+        Math.abs(Number(config.latitude)) > 90 || Math.abs(Number(config.longitude)) > 180) {
+      throw new Error("Invalid target coordinates");
+    }
+    var before = inspectWlocCoordinates(payloadBytes, config);
+    var diagnostics = {
+      modifiedLatitudeFields: 0, modifiedLongitudeFields: 0,
+      modifiedWifiRecords: 0, modifiedCellRecords: 0,
+      supportedRecords: before.supportedRecords,
+      unsupportedRecords: before.unsupportedRecords, malformedRecords: before.malformedRecords,
+      beforeTargetRecords: before.targetRecords, afterTargetRecords: 0,
+      coordinateWireTypes: before.coordinateWireTypes, verified: false, outputVerified: false,
+      coverageComplete: before.supportedRecords > 0 && before.unsupportedRecords === 0 && before.malformedRecords === 0
+    };
     var fields = ProtobufEngine.readFields(payloadBytes);
     var parts = [];
     var wifiCount = 0;
@@ -521,11 +599,14 @@
 
     for (var i = 0; i < fields.length; i += 1) {
       var f = fields[i];
+      var modifiedBefore = diagnostics.modifiedLatitudeFields + diagnostics.modifiedLongitudeFields;
       if (f.fieldNumber === 2 && f.wireType === 2) {
-        parts.push(ProtobufEngine.makeLengthDelimitedField(2, patchWifiEntity(f.valueBytes, config)));
+        parts.push(ProtobufEngine.makeLengthDelimitedField(2, patchWifiEntity(f.valueBytes, config, diagnostics)));
+        if (diagnostics.modifiedLatitudeFields + diagnostics.modifiedLongitudeFields > modifiedBefore) diagnostics.modifiedWifiRecords += 1;
         wifiCount += 1;
       } else if (CELL_RESPONSE_TAGS[f.fieldNumber] && f.wireType === 2) {
-        parts.push(ProtobufEngine.makeLengthDelimitedField(f.fieldNumber, patchCellEntity(f.valueBytes, config)));
+        parts.push(ProtobufEngine.makeLengthDelimitedField(f.fieldNumber, patchCellEntity(f.valueBytes, config, diagnostics)));
+        if (diagnostics.modifiedLatitudeFields + diagnostics.modifiedLongitudeFields > modifiedBefore) diagnostics.modifiedCellRecords += 1;
         cellCount += 1;
       } else {
         // 关键：其余根级字段（包括 3, 4, 33 等）全量原样透传，不丢弃！
@@ -533,16 +614,26 @@
       }
     }
 
+    var payload = ByteUtils.concat(parts);
+    var after = inspectWlocCoordinates(payload, config);
+    diagnostics.afterTargetRecords = after.targetRecords;
+    diagnostics.verified = before.supportedRecords > 0 && after.supportedRecords === before.supportedRecords &&
+      after.targetRecords === before.supportedRecords && after.scannedWifi === before.scannedWifi &&
+      after.scannedCell === before.scannedCell && after.unsupportedRecords === before.unsupportedRecords &&
+      after.malformedRecords === before.malformedRecords;
+    if (before.supportedRecords > 0 && !diagnostics.verified) throw new Error("Coordinate rewrite verification failed");
     return {
-      payload: ByteUtils.concat(parts),
+      payload: payload,
       wifiCount: wifiCount,
-      cellCount: cellCount
+      cellCount: cellCount,
+      diagnostics: diagnostics
     };
   }
 
-  function buildSyntheticResponse(payload, prefix) {
+  function buildSyntheticResponse(payload, prefix, suffix) {
+    if (payload.length > 65535) throw new Error("Synthetic payload length exceeds 65535");
     var pref = prefix || APPLE_SYNTHETIC_PREFIX;
-    return ByteUtils.concat([pref, ArpcCodec.writeUInt16BE(payload.length), payload]);
+    return ByteUtils.concat([pref, ArpcCodec.writeUInt16BE(payload.length), payload, suffix || new Uint8Array(0)]);
   }
 
   function looksLikeWlocPayload(bytes) {
@@ -574,12 +665,16 @@
         var slice = responseBytes.subarray(offset);
         if (!looksLikeWlocPayload(slice)) continue;
         var patched = patchWlocPayload(slice, config);
-        if (patched.wifiCount > 0 || patched.cellCount > 0) {
+        if (patched.diagnostics.verified) {
+          var response = buildSyntheticResponse(patched.payload);
+          verifyOutputCoordinates(response, patched, config, "synthetic");
           return {
-            response: buildSyntheticResponse(patched.payload),
+            response: response,
             payload: patched.payload,
             wifiCount: patched.wifiCount,
             cellCount: patched.cellCount,
+            diagnostics: patched.diagnostics,
+            changed: !sameBytes(responseBytes, response),
             kind: "raw",
             offset: offset
           };
@@ -672,18 +767,30 @@
 
     if (extraction) {
       var patched = patchWlocPayload(extraction.payload, config);
-      if (patched.wifiCount > 0 || patched.cellCount > 0) {
+      if (!patched.diagnostics.verified) {
+        return {
+          response: responseBytes, payload: extraction.payload,
+          wifiCount: patched.wifiCount, cellCount: patched.cellCount,
+          diagnostics: patched.diagnostics, changed: false, kind: extraction.kind,
+          reason: "No supported coordinate records; schema requires device validation"
+        };
+      }
+      if (patched.diagnostics.verified) {
         var finalResponse;
-        if (extraction.kind === "arpc") {
+        if (sameBytes(patched.payload, extraction.payload)) {
+          finalResponse = responseBytes;
+        } else if (extraction.kind === "arpc") {
           finalResponse = ArpcCodec.serialize({
             version: extraction.arpc.version,
             locale: extraction.arpc.locale,
             appIdentifier: extraction.arpc.appIdentifier,
             osVersion: extraction.arpc.osVersion,
             functionId: extraction.arpc.functionId,
-            payload: patched.payload
+            payload: patched.payload,
+            suffix: extraction.arpc.suffix
           });
         } else if (extraction.kind === "marker") {
+          if (patched.payload.length > 65535) throw new Error("Marker payload length exceeds 65535");
           var newLen = ArpcCodec.writeUInt16BE(patched.payload.length);
           finalResponse = ByteUtils.concat([
             extraction.prefix,
@@ -692,15 +799,20 @@
             patched.payload,
             extraction.suffix
           ]);
+        } else if (extraction.kind === "synthetic") {
+          finalResponse = buildSyntheticResponse(patched.payload, extraction.prefix, extraction.suffix);
         } else {
-          finalResponse = buildSyntheticResponse(patched.payload, extraction.prefix);
+          finalResponse = patched.payload;
         }
 
+        verifyOutputCoordinates(finalResponse, patched, config, extraction.kind);
         return {
           response: finalResponse,
           payload: patched.payload,
           wifiCount: patched.wifiCount,
           cellCount: patched.cellCount,
+          diagnostics: patched.diagnostics,
+          changed: !sameBytes(responseBytes, finalResponse),
           kind: extraction.kind,
           prefix: extraction.prefix ? ByteUtils.toHex(extraction.prefix, 8) : ""
         };
@@ -710,15 +822,49 @@
 
     // 触发滑窗扫描兜底
     var rawScan = scanPatchRawBuffer(responseBytes, config);
+    // Finding recognizable coordinates does not identify an unknown container.
+    // Preserve it rather than sending the scanner's guessed synthetic envelope.
+    rawScan.diagnostics.outputVerified = false;
+    rawScan.diagnostics.verified = false;
+    rawScan.diagnostics.modifiedLatitudeFields = 0;
+    rawScan.diagnostics.modifiedLongitudeFields = 0;
+    rawScan.diagnostics.modifiedWifiRecords = 0;
+    rawScan.diagnostics.modifiedCellRecords = 0;
+    rawScan.diagnostics.afterTargetRecords = rawScan.diagnostics.beforeTargetRecords;
     return {
-      response: rawScan.response,
+      response: responseBytes,
       payload: rawScan.payload,
       wifiCount: rawScan.wifiCount,
       cellCount: rawScan.cellCount,
+      diagnostics: rawScan.diagnostics,
+      changed: false,
       kind: rawScan.kind,
+      reason: "Unknown raw envelope framing; passing original response",
       offset: rawScan.offset,
       strictError: strictError ? strictError.message : null
     };
+  }
+
+  function verifyOutputCoordinates(responseBytes, patched, config, expectedKind) {
+    var output = extractEnvelope(responseBytes);
+    if (!output || output.kind !== expectedKind || !sameBytes(output.payload, patched.payload)) {
+      throw new Error("Output envelope verification failed");
+    }
+    var check = inspectWlocCoordinates(output.payload, config);
+    if (!patched.diagnostics.verified || check.supportedRecords !== patched.diagnostics.supportedRecords ||
+        check.targetRecords !== patched.diagnostics.supportedRecords) {
+      throw new Error("Output coordinate verification failed");
+    }
+    patched.diagnostics.outputVerified = true;
+  }
+
+  function safeRewriteReason(err) {
+    // Never forward arbitrary runtime exceptions: they can contain private data.
+    var known = ["Invalid target coordinates", "Coordinate rewrite verification failed",
+      "Output envelope verification failed", "Output coordinate verification failed",
+      "Synthetic payload length exceeds 65535", "Marker payload length exceeds 65535",
+      "Raw scan found no valid patchable WLOC payload", "Response buffer too short for raw scan"];
+    return known.indexOf(err.message) >= 0 ? err.message : "Unsupported or malformed response structure";
   }
 
   /* ─────────────────────────────────────────────────────────────
@@ -796,7 +942,9 @@
       }
       try {
         var json = JSON.parse(data);
-        if (!json || !Number.isFinite(Number(json.latitude)) ||
+        if (!json || json.latitude == null || json.longitude == null ||
+            String(json.latitude).trim() === "" || String(json.longitude).trim() === "" ||
+            !Number.isFinite(Number(json.latitude)) ||
             !Number.isFinite(Number(json.longitude)) ||
             Math.abs(Number(json.latitude)) > 90 || Math.abs(Number(json.longitude)) > 180) {
           throw new Error("Invalid coordinates");
@@ -825,7 +973,7 @@
       $done({});
     }
 
-    function completeResponse(bodyBytes, wifiCount, cellCount) {
+    function completeResponse(bodyBytes, wifiCount, cellCount, diagnostics) {
       var sourceHeaders = ($response && $response.headers) ? $response.headers : {};
       var headers = {};
       for (var name in sourceHeaders) {
@@ -838,6 +986,9 @@
       headers["X-Location-Spoofer"] = "active";
       headers["X-Location-Spoofer-Wifi"] = String(wifiCount);
       headers["X-Location-Spoofer-Cell"] = String(cellCount);
+      headers["X-Location-Spoofer-Modified-Latitude"] = String(diagnostics.modifiedLatitudeFields);
+      headers["X-Location-Spoofer-Modified-Longitude"] = String(diagnostics.modifiedLongitudeFields);
+      headers["X-Location-Spoofer-Verified-Records"] = String(diagnostics.afterTargetRecords);
 
       // A response script uses top-level body/headers, not { response: {...} }.
       $done({ headers: headers, body: bodyBytes });
@@ -854,12 +1005,29 @@
 
         var result = spoofAppleResponse(rawBody, activeConfig);
         if (activeConfig.debug) {
-          console.log("[Location Spoofer] Patched " + result.wifiCount + " Wi-Fi, " + result.cellCount + " Cell. Format: " + result.kind);
+          var d = result.diagnostics;
+          console.log("[Location Spoofer] Format: " + result.kind +
+            "; scanned Wi-Fi=" + result.wifiCount + " Cell=" + result.cellCount +
+            "; modified Wi-Fi=" + d.modifiedWifiRecords + " Cell=" + d.modifiedCellRecords +
+            " latitude=" + d.modifiedLatitudeFields + " longitude=" + d.modifiedLongitudeFields +
+            "; verified records before=" + d.beforeTargetRecords + " after=" + d.afterTargetRecords + "/" + d.supportedRecords +
+            " outputVerified=" + d.outputVerified +
+            " coverageComplete=" + d.coverageComplete +
+            "; bytes=" + rawBody.length + "->" + result.response.length + " delta=" + (result.response.length - rawBody.length) +
+            "; unsupported=" + d.unsupportedRecords + " malformed=" + d.malformedRecords +
+            "; coordWire varint=" + d.coordinateWireTypes.varint + " fixed64=" + d.coordinateWireTypes.fixed64 +
+            " fixed32=" + d.coordinateWireTypes.fixed32 + " other=" + d.coordinateWireTypes.other);
+          if (result.reason) console.log("[Location Spoofer] Passing original response: " + result.reason);
         }
-        completeResponse(result.response, result.wifiCount, result.cellCount);
+        if (!result.changed || !result.diagnostics.outputVerified) {
+          passThrough();
+          return;
+        }
+        completeResponse(result.response, result.wifiCount, result.cellCount, result.diagnostics);
       } catch (err) {
         if (activeConfig.debug) {
-          console.log("[Location Spoofer] Failed: " + err.message);
+          console.log("[Location Spoofer] Rewrite failed; input bytes=" + (rawBody ? rawBody.length : 0) +
+            "; reason=" + safeRewriteReason(err));
         }
         if (activeConfig.failOpen) {
           passThrough();
@@ -867,7 +1035,7 @@
           $done({
             status: 500,
             headers: { "Content-Type": "text/plain" },
-            body: "Location spoofing failed: " + err.message
+            body: "Location spoofing failed: " + safeRewriteReason(err)
           });
         }
       }
@@ -912,6 +1080,7 @@
     patchWifiEntity: patchWifiEntity,
     patchCellEntity: patchCellEntity,
     patchWlocPayload: patchWlocPayload,
+    inspectWlocCoordinates: inspectWlocCoordinates,
     buildSyntheticResponse: buildSyntheticResponse,
     scanPatchRawBuffer: scanPatchRawBuffer,
     extractEnvelope: extractEnvelope,
