@@ -781,20 +781,30 @@
   /* ─────────────────────────────────────────────────────────────
      8. Shadowrocket 运行时接入 (Shadowrocket Runtime Integration)
   ───────────────────────────────────────────────────────────── */
-  function fetchRemoteConfig(url, callback) {
+  function fetchRemoteConfig(url, callback, debug) {
     if (!url || typeof $httpClient === "undefined") {
+      if (debug) console.log("[Location Spoofer] Remote config client unavailable");
       callback(null);
       return;
     }
     $httpClient.get({ url: url, timeout: 5 }, function (err, resp, data) {
-      if (err || !data || (resp && resp.status >= 400)) {
+      var code = resp ? Number(resp.status || resp.statusCode || 0) : 0;
+      if (err || !data || code >= 400) {
+        if (debug) console.log("[Location Spoofer] Remote config request failed (HTTP " + code + ")");
         callback(null);
         return;
       }
       try {
         var json = JSON.parse(data);
+        if (!json || !Number.isFinite(Number(json.latitude)) ||
+            !Number.isFinite(Number(json.longitude)) ||
+            Math.abs(Number(json.latitude)) > 90 || Math.abs(Number(json.longitude)) > 180) {
+          throw new Error("Invalid coordinates");
+        }
+        if (debug) console.log("[Location Spoofer] Remote coordinates loaded");
         callback(json);
       } catch (e) {
+        if (debug) console.log("[Location Spoofer] Remote config invalid JSON or coordinates");
         callback(null);
       }
     });
@@ -816,27 +826,28 @@
     }
 
     function completeResponse(bodyBytes, wifiCount, cellCount) {
-      var headers = ($response && $response.headers) ? $response.headers : {};
-      delete headers["Content-Encoding"];
-      delete headers["content-encoding"];
-      headers["Content-Length"] = String(bodyBytes.length);
+      var sourceHeaders = ($response && $response.headers) ? $response.headers : {};
+      var headers = {};
+      for (var name in sourceHeaders) {
+        if (!Object.prototype.hasOwnProperty.call(sourceHeaders, name)) continue;
+        var lower = name.toLowerCase();
+        if (lower !== "content-length" && lower !== "content-encoding" && lower !== "transfer-encoding") {
+          headers[name] = sourceHeaders[name];
+        }
+      }
       headers["X-Location-Spoofer"] = "active";
       headers["X-Location-Spoofer-Wifi"] = String(wifiCount);
       headers["X-Location-Spoofer-Cell"] = String(cellCount);
 
-      $done({
-        response: {
-          status: 200,
-          headers: headers,
-          body: bodyBytes
-        }
-      });
+      // A response script uses top-level body/headers, not { response: {...} }.
+      $done({ headers: headers, body: bodyBytes });
     }
 
     function processRewrite(activeConfig) {
       try {
         var rawBody = ByteUtils.toUint8Array(($response && $response.body != null) ? $response.body : ($response && $response.bodyBytes));
         if (!rawBody || rawBody.length < 2) {
+          if (activeConfig.debug) console.log("[Location Spoofer] Empty or unavailable binary response body");
           passThrough();
           return;
         }
@@ -854,27 +865,30 @@
           passThrough();
         } else {
           $done({
-            response: {
-              status: "HTTP/1.1 500 Internal Server Error",
-              headers: { "Content-Type": "text/plain" },
-              body: "Location spoofing failed: " + err.message
-            }
+            status: 500,
+            headers: { "Content-Type": "text/plain" },
+            body: "Location spoofing failed: " + err.message
           });
         }
       }
     }
 
+    if (config.debug) console.log("[Location Spoofer] Response script invoked");
     if (config.configUrl) {
       fetchRemoteConfig(config.configUrl, function (remoteData) {
-        if (remoteData) {
-          if (remoteData.latitude != null) config.latitude = Number(remoteData.latitude);
-          if (remoteData.longitude != null) config.longitude = Number(remoteData.longitude);
-          if (remoteData.horizontalAccuracy != null) config.horizontalAccuracy = Number(remoteData.horizontalAccuracy);
-          if (remoteData.verticalAccuracy != null) config.verticalAccuracy = Number(remoteData.verticalAccuracy);
-          if (remoteData.altitude != null) config.altitude = Number(remoteData.altitude);
+        if (!remoteData) {
+          // Do not rewrite to sample Beijing coords on a failed KV fetch.
+          if (config.debug) console.log("[Location Spoofer] No remote coordinates; passing original response");
+          passThrough();
+          return;
         }
+        if (remoteData.latitude != null) config.latitude = Number(remoteData.latitude);
+        if (remoteData.longitude != null) config.longitude = Number(remoteData.longitude);
+        if (remoteData.horizontalAccuracy != null) config.horizontalAccuracy = Number(remoteData.horizontalAccuracy);
+        if (remoteData.verticalAccuracy != null) config.verticalAccuracy = Number(remoteData.verticalAccuracy);
+        if (remoteData.altitude != null) config.altitude = Number(remoteData.altitude);
         processRewrite(config);
-      });
+      }, config.debug);
     } else {
       processRewrite(config);
     }
